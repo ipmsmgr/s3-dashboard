@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "domain-feed-health-dashboard"
+version = "2.0.0"
+description = "Domain Feed Health Dashboard — live tally and 30-day history from S3 feed logs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit>=1.35",
+  "streamlit-aggrid>=1.0",
+  "pandas>=2.0",
+  "boto3>=1.34",
+  "botocore>=1.34",
+  "tenacity>=8.2",
+  "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "moto[s3]>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
