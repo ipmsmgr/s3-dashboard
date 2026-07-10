@@ -12,12 +12,18 @@ import json
 import pandas as pd
 
 from domain_feed_health_dashboard.data_model import DomainRecord, FeedRecord, RouterAccessPoint
+from domain_feed_health_dashboard.services.log_parser import expected_file_count_so_far
 from domain_feed_health_dashboard.status import (
     BAND_ICONS,
     BAND_SUMMARY_COLUMNS,
+    NONE_BAND,
     build_domain_band_summary,
-    feed_health_band,
+    current_feed_band,
 )
+
+# Device panel shown for a gray (no-aimpoint) feed on the Current tab; mirrors
+# the Historical tab's "No aimpoint exists" placeholder (grid_config).
+NO_AIMPOINT_ROWS: list[dict[str, object]] = [{"field": "Aimpoint", "value": "No aimpoint exists"}]
 
 # Feed grid columns: Device ID, Status, File Count, Expected / Day, Location,
 # Collection Type, Collection Region, Proxy. headerName mapping lives in
@@ -152,13 +158,24 @@ def _first_feed_device_value(domain: DomainRecord, extractor) -> str:
     return ""
 
 
-def device_field_value_rows(routers: tuple[RouterAccessPoint, ...]) -> list[dict[str, object]]:
+def device_field_value_rows(
+    routers: tuple[RouterAccessPoint, ...],
+    *,
+    include_current_expected: bool = False,
+    now=None,
+) -> list[dict[str, object]]:
     """Return Field/Value rows for the aimpoint (device) attached to a feed.
 
     A feed has at most one device despite ``routers`` being a tuple (see
     ``db/repository.py``). The rows are the full aimpoint structure (flattened
     from the stored raw JSON — see ``aimpoint_structure.txt``) plus the device's
     file-count metrics. Two-column Field/Value layout.
+
+    ``include_current_expected`` (Current tab only) appends a **Current Expected
+    Files** row — the files expected by ``now`` from the aimpoint's operating
+    hours (:func:`~domain_feed_health_dashboard.services.log_parser.expected_file_count_so_far`),
+    the value the Current-tab band compares "Files Actual" against. The
+    Historical tab omits it.
     """
 
     if not routers:
@@ -177,6 +194,8 @@ def device_field_value_rows(routers: tuple[RouterAccessPoint, ...]) -> list[dict
     rows.extend(_flatten_aimpoint({k: v for k, v in aimpoint.items() if k != "deviceID"}))
     rows.append({"field": "Files Actual", "value": device.files_actual})
     rows.append({"field": "Files Expected", "value": device.files_expected})
+    if include_current_expected:
+        rows.append({"field": "Current Expected Files", "value": expected_file_count_so_far(aimpoint, now)})
     return rows
 
 
@@ -197,11 +216,18 @@ def feed_detail_rows(domain: DomainRecord, max_feed_rows: int | None = None) -> 
 
     rows: list[dict[str, object]] = []
     for feed in feeds:
-        band = feed_health_band(feed)
+        band = current_feed_band(feed)
         # Collection Type / Location / Collection Region / Proxy come from the
         # feed's device aimpoint (collectionType / longLat / collRegions / proxy),
         # not the FeedRecord.
         aimpoint = _parse_aimpoint(feed.routers[0]) if feed.routers else {}
+        # A gray feed has no aimpoint → its device panel says so; otherwise the
+        # full aimpoint panel incl. the "Current Expected Files" (so-far) row.
+        device_rows = (
+            NO_AIMPOINT_ROWS
+            if band == NONE_BAND
+            else device_field_value_rows(feed.routers, include_current_expected=True)
+        )
         rows.append(
             {
                 "feed_id": feed.feed_id,
@@ -213,7 +239,7 @@ def feed_detail_rows(domain: DomainRecord, max_feed_rows: int | None = None) -> 
                 "coll_region": _aimpoint_coll_regions(aimpoint),
                 "proxy": _aimpoint_proxy(aimpoint),
                 "band": band,
-                "router_rows_json": json.dumps(device_field_value_rows(feed.routers), separators=(",", ":")),
+                "router_rows_json": json.dumps(device_rows, separators=(",", ":")),
             }
         )
     return rows

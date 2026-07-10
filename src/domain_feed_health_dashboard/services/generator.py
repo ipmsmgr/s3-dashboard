@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 from domain_feed_health_dashboard.aws.scanner import S3Scanner
-from domain_feed_health_dashboard.data_model import DeviceTally, DomainSetTally
+from domain_feed_health_dashboard.data_model import DeviceTally, DomainSetTally, FeedTally
 from domain_feed_health_dashboard.db.schema import open_db
 from domain_feed_health_dashboard.services.log_parser import (
     apply_feed_line_to_tally,
@@ -44,6 +44,7 @@ from domain_feed_health_dashboard.services.log_parser import (
 from domain_feed_health_dashboard.status import (
     domain_status_from_feeds,
     feed_status_counts,
+    status_from_count,
 )
 from domain_feed_health_dashboard.utils.logger import logger
 
@@ -96,6 +97,10 @@ class Generator:
         # is downloaded at most once per process (the S3 GET is the bottleneck).
         # An empty string caches a known-missing aimpoint so it is not retried.
         self._aimpoint_cache: dict[str, str] = {}
+        # Cache of a domain's aimpoint folder → the actual aimpoint .json key,
+        # discovered by listing (the file name need not match the device folder,
+        # e.g. up/ru/vtomske/01/tomsk01.json). One list per domain per process.
+        self._domain_aimpoint_cache: dict[str, dict[str, str]] = {}
 
     @property
     def tally(self) -> DomainSetTally:
@@ -115,6 +120,7 @@ class Generator:
         (e.g. from a manual "Refresh now") to pick up config changes.
         """
         self._aimpoint_cache.clear()
+        self._domain_aimpoint_cache.clear()
 
     # ── Startup ───────────────────────────────────────────────────────────
 
@@ -144,6 +150,9 @@ class Generator:
 
         for obj in sorted(today_feeds, key=lambda o: o.key):
             self._process_feed_file(obj.key)
+
+        with self._lock:
+            self._add_aimpoint_only_devices(self._tally)
 
         logger.info(
             "Tally rebuilt",
@@ -195,6 +204,7 @@ class Generator:
             tally = DomainSetTally(set_date=set_date)
             for obj in sorted(objects, key=lambda o: o.key):
                 self._process_feed_file(obj.key, tally)
+            self._add_aimpoint_only_devices(tally)
             self._push_tally_to_sqlite(tally)
             logger.info(
                 "Backfilled history day",
@@ -221,6 +231,13 @@ class Generator:
                 self._push_tally_to_sqlite(self._tally)
                 self._tally = DomainSetTally(set_date=today)
                 self._last_feed_key = ""
+                # Re-pull aimpoints for the new day. They are cached for the
+                # process lifetime, so without this every day would reuse the same
+                # stale aimpoint; clearing here lets each day snapshot ITS aimpoint
+                # (S3 keeps only the current, non-dated file), so genuine per-day
+                # aimpoint history accumulates as the aimpoint changes over time.
+                self._aimpoint_cache.clear()
+                self._domain_aimpoint_cache.clear()
 
         # List new feed files since last poll.
         new_feeds = self.scanner.list_prefix(
@@ -235,6 +252,9 @@ class Generator:
             self._process_feed_file(obj.key)
             if obj.key > self._last_feed_key:
                 self._last_feed_key = obj.key
+
+        with self._lock:
+            self._add_aimpoint_only_devices(self._tally)
 
         logger.info(
             "Cycle complete",
@@ -262,23 +282,28 @@ class Generator:
         if not content:
             return
 
-        # Collect unique device_id → aimpoint folder before parsing so we can
-        # batch-fetch each device's aimpoint file. The folder is the delivered
-        # path prefix up to (and including) the device, e.g.
-        # "up/ru/axioma/remontDorog26" — see aimpoint_structure.txt.
-        device_folder_map: dict[str, str] = {}  # device_id → aimpoint folder
+        # Collect (domain_id, device_id) → (delivered folder, delivered file name)
+        # before parsing so we can batch-fetch each device's aimpoint. Keying by
+        # device_id ALONE is wrong: device ids like "24" are not globally unique,
+        # so up/ru/sharyaOnline/24 and up/ru/lanoptic/24 would collide. The file
+        # name is needed because the aimpoint is named after the device's
+        # filenameBase (sharya24.json ↔ sharya24_2026-...mp4), which need not
+        # match the delivered folder segment ("24") — see aimpoint_structure.txt.
+        device_info_map: dict[tuple[str, str], tuple[str, str]] = {}
         parsed_lines: list[dict] = []
 
         for line in content.splitlines():
             data = parse_feed_line(line)
             if data:
                 parsed_lines.append(data)
-                folder, _, _, _ = extract_folder_and_date(str(data.get("delivered", "")))
+                delivered = str(data.get("delivered", ""))
+                folder, _, _, _ = extract_folder_and_date(delivered)
                 if folder:
-                    device_folder_map[str(data["device_id"])] = folder
+                    filename = delivered.rsplit("/", 1)[-1]
+                    device_info_map[(str(data["domain_id"]), str(data["device_id"]))] = (folder, filename)
 
-        # Fetch device files — one per unique device_id.
-        device_tallies = self._fetch_device_files(device_folder_map)
+        # Fetch device files — one per unique (domain, device).
+        device_tallies = self._fetch_device_files(device_info_map)
 
         if target_tally is None:
             with self._lock:
@@ -296,55 +321,158 @@ class Generator:
 
     def _fetch_device_files(
         self,
-        device_folder_map: dict[str, str],
-    ) -> dict[str, DeviceTally]:
+        device_info_map: dict[tuple[str, str], tuple[str, str]],
+    ) -> dict[tuple[str, str], DeviceTally]:
         """Fetch and parse aimpoint (device) JSON files for the given devices.
 
-        Aimpoint files live at the delivered-path prefix under the aimpoints
-        root (see aimpoint_structure.txt)::
+        A domain's aimpoints are discovered by listing ``{DEVICE_PREFIX}<domain_id>/``
+        (see :meth:`_match_aimpoint`), and each aimpoint's **base name** becomes the
+        device name — the aimpoint file name is the device's ``filenameBase`` and
+        need not match the delivered folder segment (``up/ru/sharyaOnline/24/…``
+        delivers ``sharya24_….mp4`` whose aimpoint is ``sharya24.json``).
 
-            {DEVICE_PREFIX}<folder>/<device_id>.json
-            e.g. dboard/aimpoints/up/ru/24oko/glazok1080/glazok1080.json
-
-        where ``<folder>`` is the feed's delivered prefix (``up/ru/24oko/glazok1080``).
-        Each device file is read at most once (dedup by device_id).
+        Keyed by ``(domain_id, delivered_device_id)`` — device ids are only unique
+        within a domain. Each distinct S3 key is read at most once.
 
         Args:
-            device_folder_map: Mapping of ``device_id → aimpoint folder``
-                               collected from the current feed file.
+            device_info_map: ``(domain_id, device_id) → (delivered folder, delivered file name)``
+                             collected from the current feed file.
 
         Returns:
-            Dict mapping ``device_id → DeviceTally``.
+            Dict mapping ``(domain_id, delivered_device_id) → DeviceTally`` whose
+            ``device_id`` is the aimpoint file's base name.
         """
-        keys_by_device = {
-            device_id: f"{DEVICE_PREFIX}{folder}/{device_id}.json"
-            for device_id, folder in device_folder_map.items()
-        }
+        resolved: dict[tuple[str, str], str] = {}  # (dom, dev) → aimpoint s3 key
+        for (domain_id, device_id), (folder, filename) in device_info_map.items():
+            key = self._match_aimpoint(domain_id, folder, filename)
+            if key:
+                resolved[(domain_id, device_id)] = key
 
-        # Fetch only aimpoints not already cached, in parallel — the per-file S3
-        # round-trip is the dominant cost. A device recurs across many feed
-        # files / backfill days, so caching collapses those to one download.
-        missing = {key for key in keys_by_device.values() if key not in self._aimpoint_cache}
-        if missing:
-            def _read(key: str) -> tuple[str, str]:
-                try:
-                    return key, self.scanner.read_text_file(S3_BUCKET, key)
-                except Exception as exc:
-                    logger.warning("Could not fetch device file", extra={"key": key, "error": str(exc)})
-                    return key, ""
+        self._cache_aimpoints(set(resolved.values()))
 
-            with ThreadPoolExecutor(max_workers=min(DEVICE_FETCH_WORKERS, len(missing))) as pool:
-                for key, content in pool.map(_read, missing):
-                    self._aimpoint_cache[key] = content
-
-        result: dict[str, DeviceTally] = {}
-        for device_id, key in keys_by_device.items():
+        result: dict[tuple[str, str], DeviceTally] = {}
+        for (domain_id, device_id), key in resolved.items():
             content = self._aimpoint_cache.get(key, "")
             if content:
-                tally = parse_device_json(content, device_id)
+                # device_id = aimpoint base name (the device's filenameBase)
+                tally = parse_device_json(content, self._aimpoint_basename(key))
                 if tally:
-                    result[device_id] = tally
+                    result[(domain_id, device_id)] = tally
         return result
+
+    @staticmethod
+    def _aimpoint_basename(key: str) -> str:
+        """``dboard/aimpoints/up/ru/sharyaOnline/24/sharya24.json`` → ``sharya24``."""
+        return key.rsplit("/", 1)[-1][: -len(".json")]
+
+    def _match_aimpoint(self, domain_id: str, folder: str, filename: str) -> str:
+        """Return the aimpoint S3 key for a delivered device, or ``""``.
+
+        The aimpoint's location is not assumed: a domain's aimpoints are listed
+        once, then matched to the delivered device by
+
+        1. an aimpoint sitting directly in the delivered device folder, else
+        2. the aimpoint whose base name is the delivered file's base name —
+           delivered files are ``<filenameBase>_<suffix>`` and the aimpoint is
+           ``<filenameBase>.json`` (longest base name wins, so ``tomsk21`` beats
+           ``tomsk2``).
+
+        Matching on the base name (rather than the folder segment) is what keeps a
+        device from appearing twice: the delivery and the aimpoint enumeration
+        both resolve to the same name.
+        """
+        keys = self._aimpoint_keys_under(domain_id)
+        if not keys:
+            return ""
+
+        in_folder = f"{DEVICE_PREFIX}{folder}/"
+        for key in keys:
+            if key.startswith(in_folder) and "/" not in key[len(in_folder):]:
+                return key
+
+        best = ""
+        for key in keys:
+            base = self._aimpoint_basename(key)
+            if filename == base or filename.startswith(base + "_") or filename.startswith(base + "."):
+                if not best or len(base) > len(self._aimpoint_basename(best)):
+                    best = key
+        return best
+
+    def _cache_aimpoints(self, keys: set[str]) -> None:
+        """Download any of *keys* not already cached, in parallel.
+
+        The per-file S3 round-trip is the dominant cost, and a device recurs
+        across many feed files / backfill days, so caching collapses those to one
+        download. An empty string caches a known-missing file.
+        """
+        missing = {key for key in keys if key not in self._aimpoint_cache}
+        if not missing:
+            return
+
+        def _read(key: str) -> tuple[str, str]:
+            try:
+                return key, self.scanner.read_text_file(S3_BUCKET, key)
+            except Exception as exc:  # noqa: BLE001 - surfaced as a missing aimpoint
+                logger.warning("Could not fetch device file", extra={"key": key, "error": str(exc)})
+                return key, ""
+
+        with ThreadPoolExecutor(max_workers=min(DEVICE_FETCH_WORKERS, len(missing))) as pool:
+            for key, content in pool.map(_read, missing):
+                self._aimpoint_cache[key] = content
+
+    def _add_aimpoint_only_devices(self, tally: DomainSetTally) -> None:
+        """Add devices that have an aimpoint but delivered no files this period.
+
+        The pipeline is delivery-driven, so a configured device producing no files
+        would otherwise be invisible — exactly the condition an operator needs to
+        see (e.g. ``up/ru/vtomske`` has aimpoints for ``01/11/21/29`` but only
+        ``21`` delivers). For each domain already in the tally, every aimpoint
+        under ``{DEVICE_PREFIX}<domain_id>/`` that is not already a device becomes
+        a device + feed with a **zero** delivered count.
+        """
+        for domain_tally in tally.domains.values():
+            keys = self._aimpoint_keys_under(domain_tally.domain_id)
+            if not keys:
+                continue
+            self._cache_aimpoints(set(keys))
+            for key in keys:
+                basename = self._aimpoint_basename(key)
+                if basename in domain_tally.devices:
+                    continue                       # already delivering
+                content = self._aimpoint_cache.get(key, "")
+                if not content:
+                    continue
+                dev = parse_device_json(content, basename)
+                if dev is None:
+                    continue
+                domain_tally.devices[basename] = dev          # files_actual stays 0
+                domain_tally.feeds[basename] = FeedTally(
+                    feed_id=basename,
+                    device_id=basename,
+                    domain_id=domain_tally.domain_id,
+                    status=status_from_count(0, dev.files_expected),
+                    device_status=dev.health_status,
+                    count=0,
+                    folder=key.rsplit("/", 1)[0][len(DEVICE_PREFIX):],
+                )
+
+    def _aimpoint_keys_under(self, domain_id: str) -> list[str]:
+        """Every aimpoint ``.json`` S3 key under a domain (listed once, cached).
+
+        No assumption is made about layout: the aimpoints may sit in per-device
+        folders (``up/ru/vtomske/01/tomsk01.json``) or flat under the domain —
+        callers key them by base name, not by folder.
+        """
+        if domain_id in self._domain_aimpoint_cache:
+            return self._domain_aimpoint_cache[domain_id]
+        keys: list[str] = []
+        prefix = f"{DEVICE_PREFIX}{domain_id}/"
+        try:
+            keys = [obj.key for obj in self.scanner.list_prefix(S3_BUCKET, prefix) if obj.key.endswith(".json")]
+        except Exception as exc:  # noqa: BLE001 - listing is best-effort
+            logger.warning("Could not list aimpoint folder", extra={"prefix": prefix, "error": str(exc)})
+        self._domain_aimpoint_cache[domain_id] = keys
+        return keys
 
     # ── Midnight push ─────────────────────────────────────────────────────
 
@@ -426,12 +554,24 @@ class Generator:
                              op_window_start, op_window_end, files_actual, files_expected)
                         VALUES (?,?,?,?,?,?,?,?)
                         ON CONFLICT (set_id, device_id) DO UPDATE SET
-                            aimpoint_json  = excluded.aimpoint_json,
+                            -- Per-day snapshot: freeze the aimpoint (and its
+                            -- derived op window / expected count) once captured, so
+                            -- a re-push/backfill never overwrites a day's historical
+                            -- aimpoint. Fill it only if the stored one is empty.
+                            aimpoint_json = CASE
+                                WHEN devices.aimpoint_json IS NULL OR devices.aimpoint_json IN ('', '{}')
+                                THEN excluded.aimpoint_json ELSE devices.aimpoint_json END,
+                            op_window_start = CASE
+                                WHEN devices.aimpoint_json IS NULL OR devices.aimpoint_json IN ('', '{}')
+                                THEN excluded.op_window_start ELSE devices.op_window_start END,
+                            op_window_end = CASE
+                                WHEN devices.aimpoint_json IS NULL OR devices.aimpoint_json IN ('', '{}')
+                                THEN excluded.op_window_end ELSE devices.op_window_end END,
+                            files_expected = CASE
+                                WHEN devices.aimpoint_json IS NULL OR devices.aimpoint_json IN ('', '{}')
+                                THEN excluded.files_expected ELSE devices.files_expected END,
                             health_status  = excluded.health_status,
-                            op_window_start = excluded.op_window_start,
-                            op_window_end  = excluded.op_window_end,
-                            files_actual   = excluded.files_actual,
-                            files_expected = excluded.files_expected
+                            files_actual   = excluded.files_actual
                         """,
                         (
                             set_id, dev.device_id, dev.aimpoint_json, dev.health_status,

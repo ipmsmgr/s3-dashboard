@@ -162,6 +162,70 @@ def expected_file_count(aimpoint: dict) -> int:
     return operation // interval
 
 
+def _operating_intervals(aimpoint: dict) -> list[tuple[int, int]]:
+    """The aimpoint's operating windows as ``[start, stop)`` minute-of-day ranges.
+
+    No ``hours`` (or no parseable window) → a single 24-hour window. Overnight
+    windows (``stop <= start``) are split into two same-day ranges so each range
+    lies within ``[0, 1440)``.
+    """
+    hours = aimpoint.get("hours")
+    if not isinstance(hours, dict) or not hours.get("hrs"):
+        return [(0, _MINUTES_PER_DAY)]
+    intervals: list[tuple[int, int]] = []
+    for window in hours.get("hrs") or []:
+        if not isinstance(window, str) or "-" not in window:
+            continue
+        start_s, stop_s = window.split("-", 1)
+        start = _hhmm_to_minutes(start_s)
+        stop = _hhmm_to_minutes(stop_s)
+        if start is None or stop is None:
+            continue
+        if stop > start:
+            intervals.append((start, stop))
+        else:                                   # overnight / 0000-0000 → wraps
+            intervals.append((start, _MINUTES_PER_DAY))
+            intervals.append((0, stop))
+    return intervals or [(0, _MINUTES_PER_DAY)]
+
+
+def _now_minute_of_day(aimpoint: dict, now: datetime) -> int:
+    """Minute-of-day of ``now`` in the aimpoint's ``hours.tz`` (UTC if absent)."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    hours = aimpoint.get("hours")
+    tzname = hours.get("tz") if isinstance(hours, dict) else None
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = now.astimezone(ZoneInfo(str(tzname)))
+        except Exception:  # noqa: BLE001 - unknown tz → fall back to the given offset
+            pass
+    return now.hour * 60 + now.minute
+
+
+def expected_file_count_so_far(aimpoint: dict, now: Optional[datetime] = None) -> int:
+    """Files that should have been delivered from the day's start up to ``now``.
+
+    Like :func:`expected_file_count` but only counts the operating minutes that
+    have already elapsed today (in the aimpoint's timezone), so the Current tab
+    can compare against files delivered *so far*. ``rndm`` is not included (it is
+    a random daily tail, not attributable to a specific minute). ``now`` defaults
+    to the current UTC time.
+    """
+    interval = _interval_minutes(aimpoint)
+    if interval <= 0:
+        return 0
+    now_min = _now_minute_of_day(aimpoint, now or datetime.now(timezone.utc))
+    elapsed = 0
+    for start, stop in _operating_intervals(aimpoint):
+        lo, hi = max(start, 0), min(stop, now_min)
+        if hi > lo:
+            elapsed += hi - lo
+    return elapsed // interval
+
+
 # ── Feed log line parser ───────────────────────────────────────────────────
 
 def parse_feed_line(line: str) -> Optional[dict]:
@@ -175,10 +239,16 @@ def parse_feed_line(line: str) -> Optional[dict]:
 
     Current dBoardData format::
 
-        {"eventType": "dBoardData", "delivered": "<region>/<country>/<domain>/<device>/..."}
+        {"eventType": "dBoardData", "delivered": "<up>/<country>/<name>/<device>/<YYYY>/<MM>/<DD>/<file>"}
 
-    For the current format, ``domain_id``, ``feed_id``, and ``device_id`` are
-    derived from path components 2, 3, and 3 of the delivered path respectively.
+    For the current format the **domain** is the full three-segment key
+    ``up/<country>/<name>`` (e.g. ``up/ru/powernet.com.ru``, ``up/bb/worldcam``)
+    and the **device** is the segment just before the date. Most paths have a
+    dedicated device folder (``up/ru/24oko/glazok1080/<date>/…`` → domain
+    ``up/ru/24oko``, device ``glazok1080``); some go straight from the domain to
+    the date with no device folder (``up/eg/makaniBeachClub/<date>/…`` → domain
+    ``up/eg/makaniBeachClub``, device ``makaniBeachClub`` — the domain's last
+    segment). The device's aimpoint is then ``dboard/aimpoints/<domain>/<device>.json``.
 
     Returns the parsed dict (augmented if needed) or ``None`` on failure.
     """
@@ -195,25 +265,28 @@ def parse_feed_line(line: str) -> Optional[dict]:
         logger.debug("JSON decode error", extra={"error": str(exc), "line": line[:120]})
         return None
 
-    # Current format: derive identifiers from the delivered path. Canonical
-    # structure is <key.../>/<domain>/<device>/<YYYY>/<MM>/<DD>/<file>, so the
-    # domain is at index 2 and the device at index 3, with the date starting at
-    # index 4. Skip lines whose date is shifted into the domain/device slots
-    # (e.g. empty path segments that push 2026/06/.. into those positions) or
-    # whose domain/device segment is empty, so date components and empty
+    # Current format: derive identifiers from the delivered path. The domain is
+    # the three-segment key ``up/<country>/<name>`` (parts[:3]); the device is the
+    # segment just before the date (parts[date_start - 1]) — parts[3] when a
+    # device folder is present (date_start == 4), or parts[2] (the domain's last
+    # segment) when the path goes straight to the date (date_start == 3). Skip
+    # lines whose date is shifted into the first three (domain) slots (date_start
+    # < 3) or whose domain/device segment is empty, so date components and empty
     # directories are never ingested as domains/feeds.
     if data.get("eventType") == "dBoardData" and data.get("delivered"):
         parts = data["delivered"].split("/")
         date_start = _date_start_index(parts)
-        if date_start is None or date_start < 4 or not parts[2] or not parts[3]:
+        if date_start is None or date_start < 3 or not all(parts[:3]) or not parts[date_start - 1]:
             logger.debug(
                 "Skipping delivered path with missing/empty domain or device",
                 extra={"delivered": data["delivered"]},
             )
             return None
-        data["domain_id"] = parts[2]
-        data["feed_id"]   = parts[3]
-        data["device_id"] = parts[3]
+        device = parts[date_start - 1]
+        data["domain_id"]   = "/".join(parts[:3])
+        data["domain_name"] = data["domain_id"]
+        data["feed_id"]     = device
+        data["device_id"]   = device
 
     required = ("domain_id", "feed_id", "device_id")
     if not all(data.get(k) for k in required):
@@ -246,7 +319,13 @@ def parse_device_json(content: str, device_id: str) -> Optional[DeviceTally]:
 
     Args:
         content:   Raw file content (UTF-8 string).
-        device_id: The device ID expected in or associated with this file.
+        device_id: The device name to use — the aimpoint file's **base name**
+                   (its ``filenameBase``, e.g. ``tomsk21`` from ``tomsk21.json``).
+                   The aimpoint's own ``deviceID`` field must NOT set the identity:
+                   it is a short, folder-scoped id (``tomsk21.json`` carries
+                   ``"deviceID": "21"``) that collides across domains and does not
+                   match the name the delivery/enumeration paths resolve to. It is
+                   still kept verbatim inside ``aimpoint_json`` for display.
 
     Returns:
         :class:`DeviceTally` or ``None`` on parse failure.
@@ -261,7 +340,7 @@ def parse_device_json(content: str, device_id: str) -> Optional[DeviceTally]:
 
     op_start, op_end = _op_window_from_hours(data)
     return DeviceTally(
-        device_id       = str(data.get("deviceID", data.get("device_id", device_id))),
+        device_id       = device_id,
         aimpoint_json   = json.dumps(data, separators=(",", ":")),
         health_status   = str(data.get("health_status", "yellow")).lower(),
         op_window_start = op_start,
@@ -275,19 +354,19 @@ def parse_device_json(content: str, device_id: str) -> Optional[DeviceTally]:
 def apply_feed_line_to_tally(
     data: dict,
     tally: DomainSetTally,
-    device_tallies: dict[str, DeviceTally],
+    device_tallies: dict[tuple[str, str], DeviceTally],
 ) -> None:
     """Merge one parsed feed-log record into the in-memory *tally*.
 
     Args:
         data:           Parsed JSON dict from :func:`parse_feed_line`.
         tally:          The live :class:`DomainSetTally` to update.
-        device_tallies: Dict mapping ``device_id → DeviceTally`` already
-                        fetched for this generator cycle.
+        device_tallies: Dict mapping ``(domain_id, device_id) → DeviceTally``
+                        already fetched for this generator cycle. Keyed by the
+                        pair because device ids are only unique within a domain.
     """
     domain_id   = str(data["domain_id"])
-    feed_id     = str(data["feed_id"])
-    device_id   = str(data["device_id"])
+    delivered_device = str(data["device_id"])   # from the delivered path, e.g. "01"
     domain_name = str(data.get("domain_name", domain_id))
 
     delivered   = str(data.get("delivered", ""))
@@ -296,9 +375,15 @@ def apply_feed_line_to_tally(
 
     domain_tally = tally.get_or_create_domain(domain_id, domain_name, folder)
 
+    # The device/feed identity is the aimpoint file's base name (e.g. "tomsk01"),
+    # resolved by the Generator when it read the aimpoint; fall back to the
+    # delivered-path segment when no aimpoint was found.
+    dev = device_tallies.get((domain_id, delivered_device))
+    device_id = dev.device_id if dev is not None else delivered_device
+    feed_id   = device_id
+
     # Attach device tally to domain (once per device_id per cycle).
     if device_id not in domain_tally.devices:
-        dev = device_tallies.get(device_id)
         if dev is None:
             # Device file unavailable — create a minimal placeholder whose
             # expected daily count assumes 24h operation at the default

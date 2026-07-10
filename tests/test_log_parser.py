@@ -1,9 +1,66 @@
 import json
+from datetime import datetime, timezone
 
 from domain_feed_health_dashboard.services.log_parser import (
     expected_file_count,
+    expected_file_count_so_far,
+    extract_folder_and_date,
     parse_device_json,
+    parse_feed_line,
 )
+
+
+def _delivered(path: str) -> dict:
+    return json.dumps({"eventType": "dBoardData", "delivered": path})
+
+
+def test_parse_feed_line_domain_is_full_three_segment_path_with_device_folder():
+    # up/ru/24oko/glazok1080/<date>/… → domain "up/ru/24oko", device "glazok1080".
+    data = parse_feed_line(_delivered("up/ru/24oko/glazok1080/2026/07/09/glazok1080_x.mp4"))
+    assert data["domain_id"] == "up/ru/24oko"
+    assert data["domain_name"] == "up/ru/24oko"
+    assert data["device_id"] == "glazok1080"
+    assert data["feed_id"] == "glazok1080"
+
+
+def test_parse_feed_line_straight_to_date_uses_domain_last_segment_as_device():
+    # up/eg/makaniBeachClub/<date>/… (no device folder) → domain
+    # "up/eg/makaniBeachClub", device "makaniBeachClub"; aimpoint folder matches.
+    path = "up/eg/makaniBeachClub/2026/07/09/makaniBeachClub_x.mp4"
+    data = parse_feed_line(_delivered(path))
+    assert data["domain_id"] == "up/eg/makaniBeachClub"
+    assert data["device_id"] == "makaniBeachClub"
+    folder, y, m, d = extract_folder_and_date(path)
+    assert folder == "up/eg/makaniBeachClub"          # aimpoint: <folder>/<device>.json
+    assert (y, m, d) == ("2026", "07", "09")
+
+
+def test_parse_feed_line_skips_date_shifted_into_domain_slots():
+    # Empty segments push the date into the domain slots → skipped, not ingested.
+    assert parse_feed_line(_delivered("up//2026/07/09/x.mp4")) is None
+    assert parse_feed_line(_delivered("up/ru//2026/07/09/x.mp4")) is None
+
+
+def test_expected_file_count_so_far_counts_only_elapsed_operating_minutes():
+    noon = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    # 24h operation: 720 elapsed minutes / 15 = 48 by noon.
+    assert expected_file_count_so_far({"transcoderInterval": 15}, noon) == 48
+    # 09:00-18:00 window: 180 elapsed minutes by noon → 12.
+    win = {"transcoderInterval": 15, "hours": {"tz": "UTC", "hrs": ["0900-1800"]}}
+    assert expected_file_count_so_far(win, noon) == 12
+    # Before the window opens → 0; after it closes → the full window count.
+    assert expected_file_count_so_far(win, datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc)) == 0
+    assert expected_file_count_so_far(win, datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc)) == expected_file_count(win)
+
+
+def test_expected_file_count_so_far_honors_timezone_and_overnight_windows():
+    noon = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    # 09:00-18:00 US/Eastern: noon UTC is 07:00 ET, before the window → 0.
+    et = {"transcoderInterval": 15, "hours": {"tz": "US/Eastern", "hrs": ["0900-1800"]}}
+    assert expected_file_count_so_far(et, noon) == 0
+    # Overnight 22:00-06:00: at 03:00 UTC, 180 min of the morning portion → 12.
+    overnight = {"transcoderInterval": 15, "hours": {"tz": "UTC", "hrs": ["2200-0600"]}}
+    assert expected_file_count_so_far(overnight, datetime(2026, 1, 1, 3, 0, tzinfo=timezone.utc)) == 12
 
 
 def test_expected_file_count_no_hours_is_full_day():
@@ -64,6 +121,15 @@ def test_parse_device_json_full_day_when_no_hours():
     assert (tally.op_window_start, tally.op_window_end) == ("00:00", "00:00")
     assert tally.files_expected == 96
     assert json.loads(tally.aimpoint_json) == {"deviceID": "d"}
+
+
+def test_parse_device_json_identity_is_the_file_base_name_not_the_deviceID_field():
+    # tomsk21.json carries "deviceID": "21" — a short, folder-scoped id that
+    # collides across domains. The file's base name is the device identity; the
+    # raw deviceID is still preserved inside aimpoint_json for display.
+    tally = parse_device_json(json.dumps({"deviceID": "21", "collectionType": "M3U"}), "tomsk21")
+    assert tally.device_id == "tomsk21"
+    assert json.loads(tally.aimpoint_json)["deviceID"] == "21"
 
 
 def test_parse_device_json_rejects_non_object():

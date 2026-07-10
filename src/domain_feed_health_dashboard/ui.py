@@ -186,6 +186,25 @@ def _install_css() -> None:
             font-weight: 700;
             color: #111827;
           }
+          /* Domain status filter: stack the selected boxes one per line, each
+             full width (uniform), showing the whole label (no truncation), and
+             let the control grow vertically so every box fits without scrolling. */
+          .stMultiSelect div[data-baseweb="select"] > div:first-child {
+            flex-wrap: wrap;
+            max-height: none !important;
+            overflow: visible !important;
+          }
+          .stMultiSelect span[data-baseweb="tag"] {
+            width: 100%;
+            max-width: 100% !important;
+            box-sizing: border-box;
+          }
+          .stMultiSelect span[data-baseweb="tag"] span {
+            max-width: 100% !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+            white-space: normal !important;
+          }
         </style>
         """,
         unsafe_allow_html=True,
@@ -299,7 +318,6 @@ def _render_history_section(
     window_days: int,
     search_text: str,
     selected_statuses: list[str],
-    only_red_feeds: bool,
     live_domains: tuple[DomainRecord, ...] = (),
 ) -> None:
     try:
@@ -329,7 +347,7 @@ def _render_history_section(
         return
 
     # Same sidebar filters as the Current tab apply here.
-    visible_ids = filter_domain_band_summary(master_df, search_text, selected_statuses, only_red_feeds)
+    visible_ids = filter_domain_band_summary(master_df, search_text, selected_statuses)
     visible_master = master_df[master_df["domain_id"].isin(visible_ids)].reset_index(drop=True)
 
     _render_overall_metrics(visible_master)
@@ -344,7 +362,9 @@ def _render_history_section(
         key="history_domain_master_detail_aggrid",
         height=_full_grid_height(len(visible_master)),
         enable_enterprise_modules=True,
-        fit_columns=True,
+        # Column widths are governed by per-column flex (Trend 1.5×), so don't
+        # also run sizeColumnsToFit — the two would fight.
+        fit_columns=False,
     )
 
     _render_history_feed_linechart(response, visible_master, date_headers)
@@ -437,28 +457,43 @@ def main() -> None:
     with st.sidebar:
         st.title("Domain Feed Health Dashboard")
         st.markdown(
-            '<div class="info-banner"><strong>Live data.</strong> '
-            "Current view reads today's domains/feeds from S3 via the Generator service; Historical view reads "
-            "the local SQLite database the Generator writes to at UTC midnight.</div>",
+            '<div class="info-banner"><strong>Live feed health at a glance.</strong> '
+            "The <strong>Current</strong> tab shows today's domain, feed, and device health. "
+            "The <strong>Historical</strong> tab shows the last 30 days. Filters below apply to both.</div>",
             unsafe_allow_html=True,
         )
         st.header("Dashboard controls")
-        db_path = st.text_input("SQLite history database path", value=DEFAULT_DB_PATH)
-        if st.button("Refresh now"):
+        db_path = st.text_input(
+            "SQLite history database path",
+            value=DEFAULT_DB_PATH,
+            help="Local database file the Historical tab reads from (the Generator writes to it at "
+            "UTC midnight). Overridable with the DASHBOARD_DB_PATH environment variable.",
+        )
+        st.markdown("**Refresh data**")
+        if st.button(
+            "Refresh now",
+            help="Poll S3 for new files right now and re-pull aimpoint metadata, instead of waiting "
+            "for the automatic 15-minute cycle.",
+        ):
             st.session_state[_LAST_CYCLE_SESSION_KEY] = 0.0
             try:
                 # Also re-pull aimpoint metadata on the next cycle.
                 _get_generator(db_path).clear_aimpoint_cache()
             except Exception:  # noqa: BLE001 - refresh is best-effort
                 pass
-        search_text = st.text_input("Search domains", value="")
+        search_text = st.text_input(
+            "Search domains",
+            value="",
+            help="Show only domains whose name contains this text (applies to both tabs).",
+        )
         selected_statuses = st.multiselect(
             "Domain status filter",
             options=BAND_OPTIONS,
             default=BAND_OPTIONS,
             format_func=lambda value: BAND_ICONS[value],
+            help="Show only domains whose status is one of the selected color bands "
+            "(⚪ 0% = no aimpoint). Applies to both tabs.",
         )
-        only_red_feeds = st.checkbox("Show only domains with red feeds", value=False)
         history_window_days = st.slider(
             "Historical window (days)",
             min_value=MIN_HISTORY_WINDOW_DAYS,
@@ -468,17 +503,25 @@ def main() -> None:
             help="How many UTC days back from today the Historical view's feed/device day-pivot grid covers.",
         )
 
-        # Historical view: description + backfill, at the bottom of the sidebar.
-        st.subheader("Feed history")
-        st.caption(
-            "Click a domain row to expand its feeds, then click a feed to inspect its device "
-            "(aimpoint), mirroring the Current tab. Domain Status is the WINDOW aggregate over the "
-            f"selected {history_window_days} days (total delivered ÷ total expected), so shrinking "
-            "the window can change a domain's color. Each feed cell shows that day's delivered file "
-            "count, colored by delivered ÷ expected: green = 95-100%, yellow = 80-94%, "
-            "orange = 70-79%, red = 0-69% or over 100%; — = feed not present that day."
+        # Historical view: description (in the subheader's help tooltip) + backfill,
+        # at the bottom of the sidebar.
+        st.subheader(
+            "Feed history",
+            help=(
+                "Click a domain row to expand its feeds, then click a feed to inspect its device "
+                "(aimpoint), mirroring the Current tab. Domain Status is the WINDOW aggregate over the "
+                f"selected {history_window_days} days (total delivered ÷ total expected), so shrinking "
+                "the window can change a domain's color. Each feed cell shows that day's delivered file "
+                "count, colored by delivered ÷ expected: green = 95-100%, yellow = 80-94%, "
+                "orange = 70-79%, red = 0-69% or over 100%; — = feed not present that day."
+            ),
         )
-        if st.button("Backfill / refresh history now", key="history_backfill_button"):
+        if st.button(
+            "Backfill / refresh history now",
+            key="history_backfill_button",
+            help="Fill any missing completed days into the history database from S3. May take a "
+            "while when many days are missing.",
+        ):
             try:
                 with st.spinner("Backfilling history from S3 — this can take a while depending on how many days are missing..."):
                     _get_generator(db_path).backfill_history()
@@ -495,7 +538,7 @@ def main() -> None:
             st.warning(f"Live data unavailable right now: {live_error}")
 
         summary = build_domain_band_summary(live_domains)
-        visible_ids = filter_domain_band_summary(summary, search_text, selected_statuses, only_red_feeds)
+        visible_ids = filter_domain_band_summary(summary, search_text, selected_statuses)
         visible_summary = summary[summary["domain_id"].isin(visible_ids)]
         visible_domains = tuple(
             domain for domain in live_domains if (domain.domain_id or domain.domain_name) in visible_ids
@@ -510,6 +553,5 @@ def main() -> None:
             window_days=int(history_window_days),
             search_text=search_text,
             selected_statuses=selected_statuses,
-            only_red_feeds=only_red_feeds,
             live_domains=live_domains,
         )

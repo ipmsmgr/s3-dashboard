@@ -59,7 +59,14 @@ def test_feed_detail_rows_has_required_eight_visible_columns_plus_hidden_router_
     rows = feed_detail_rows(domain)
     assert list(rows[0].keys()) == FEED_DETAIL_COLUMNS
     assert len(FEED_VISIBLE_COLUMNS) == 8
-    assert json.loads(rows[0]["router_rows_json"]) == []
+
+
+def test_feed_detail_rows_gray_feed_device_panel_says_no_aimpoint():
+    # A feed with no aimpoint is gray → its device panel says "No aimpoint exists".
+    domain = DomainRecord(domain_id="DOMAIN-001", domain_name="alpha.example.net", feeds=(_feed("FEED-001", "green"),), last_observed_time="now")
+    row = feed_detail_rows(domain)[0]
+    assert row["band"] == "none"
+    assert json.loads(row["router_rows_json"]) == [{"field": "Aimpoint", "value": "No aimpoint exists"}]
 
 
 def test_feed_detail_rows_derives_expected_per_day_from_attached_device():
@@ -125,8 +132,10 @@ def test_feed_detail_rows_embeds_device_field_value_rows_for_nested_feed_expansi
     )
     row = feed_detail_rows(domain)[0]
     decoded_device_rows = json.loads(row["router_rows_json"])
-    assert decoded_device_rows == device_field_value_rows(domain.feeds[0].routers)
     assert decoded_device_rows[0] == {"field": "Device ID", "value": "DEV-001"}
+    # Current tab embeds the device panel including the current-expected row.
+    fields = {r["field"] for r in decoded_device_rows}
+    assert {"Files Actual", "Files Expected", "Current Expected Files"} <= fields
 
 
 def test_master_detail_dataframe_embeds_feed_rows_per_domain():
@@ -153,6 +162,27 @@ def test_zero_feed_domain_still_has_master_detail_row():
 
 def test_device_field_value_rows_is_empty_with_no_device():
     assert device_field_value_rows(()) == []
+
+
+def test_device_field_value_rows_current_expected_only_when_requested():
+    from datetime import datetime, timezone
+    router = _router()  # hours 09:00-18:00 US/Eastern, 15-min interval
+    # Default (Historical): no "Current Expected Files" row.
+    assert "Current Expected Files" not in {r["field"] for r in device_field_value_rows((router,))}
+    # Current tab: appended = expected-so-far. 17:00 UTC = 12:00 EST → 180 min → 12.
+    noon_est = datetime(2026, 1, 1, 17, 0, tzinfo=timezone.utc)
+    rows = device_field_value_rows((router,), include_current_expected=True, now=noon_est)
+    cur = next(r for r in rows if r["field"] == "Current Expected Files")
+    assert cur["value"] == 12
+
+
+def test_feed_detail_rows_device_panel_includes_current_expected_files():
+    domain = DomainRecord(
+        domain_id="DOMAIN-001", domain_name="alpha.example.net",
+        feeds=(_feed("FEED-001", "green", routers=(_router("DEV-001"),)),), last_observed_time="now",
+    )
+    device_fields = {r["field"] for r in json.loads(feed_detail_rows(domain)[0]["router_rows_json"])}
+    assert "Current Expected Files" in device_fields
 
 
 def test_device_field_value_rows_has_no_health_status_row():

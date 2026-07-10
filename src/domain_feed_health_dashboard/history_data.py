@@ -20,21 +20,28 @@ from domain_feed_health_dashboard.data_model import DeviceRecord, FeedRecord
 from domain_feed_health_dashboard.db.repository import Repository
 from domain_feed_health_dashboard.status import (
     BAND_SUMMARY_COLUMNS,
+    NONE_BAND,
     cell_health_band,
     rollup_band,
     summarize_domain_bands,
 )
-from domain_feed_health_dashboard.table_data import device_field_value_rows
+from domain_feed_health_dashboard.table_data import (
+    _aimpoint_coll_regions,
+    _aimpoint_proxy,
+    _parse_aimpoint,
+    device_field_value_rows,
+)
 
 FEED_ID_COLUMN = "feed_id"
 
 # Columns of the history domain master grid (one row per domain): the shared
 # band summary (status.BAND_SUMMARY_COLUMNS), a hidden ``feed_rows_json``
 # carrying that domain's feed×day pivot rows for AgGrid master/detail expansion,
-# and ``trend_img`` — a pre-rendered PNG (``data:`` URI) line sparkline of the
-# domain's daily total delivered counts, shown in the grid's last ("Trend")
+# ``coll_region`` / ``proxy`` (from any feed's device aimpoint, like the Current
+# tab); and ``trend_img`` — a pre-rendered PNG (``data:`` URI) line sparkline of
+# the domain's daily total delivered counts, shown in the grid's last ("Trend")
 # column as a cell background image (see grid_config.TREND_IMAGE_STYLE_JS).
-HISTORY_MASTER_COLUMNS = [*BAND_SUMMARY_COLUMNS, "feed_rows_json", "trend_img"]
+HISTORY_MASTER_COLUMNS = [*BAND_SUMMARY_COLUMNS, "coll_region", "proxy", "feed_rows_json", "trend_img"]
 
 # Each visible day column ``"<date>"`` (delivered file count) is paired with a
 # hidden ``"<date>__status"`` column carrying the RED/YELLOW/GREEN status used
@@ -54,8 +61,39 @@ _STATUS_CELL_STYLE: dict[str, str] = {
     "orange": "background-color: #f97316; color: #7c2d12; font-weight: 700;",
     "yellow": "background-color: #facc15; color: #422006; font-weight: 700;",
     "green": "background-color: #16a34a; color: #ffffff; font-weight: 700;",
+    "none": "background-color: #e5e7eb; color: #6b7280;",  # no aimpoint → gray
 }
 MISSING_DAY_LABEL = "—"
+
+
+def _aimpoint_by_day(
+    routers_by_day: dict[str, tuple[DeviceRecord, ...]],
+) -> dict[str, object]:
+    """The feed's stored aimpoint for *each specific day* it exists (deduped).
+
+    Returns ``{"days": {set_date: variant_index}, "variants": [<device rows>, …]}``.
+    A day is present in ``days`` only if the feed had a non-empty stored aimpoint
+    that exact day (aimpoints occasionally change, so each day maps to its own
+    variant). Identical aimpoints across days share one entry in ``variants`` to
+    keep the payload small. A clicked day not in ``days`` has no aimpoint that day
+    → "No aimpoint exists" (no fall-back to a previous day).
+    """
+    variants: list[list[dict[str, object]]] = []
+    signatures: list[str] = []
+    days: dict[str, int] = {}
+    for set_date in sorted(routers_by_day):  # oldest → newest
+        routers = routers_by_day[set_date]
+        if not routers or not routers[0].aimpoint_json:
+            continue  # no aimpoint that day
+        signature = routers[0].aimpoint_json
+        try:
+            index = signatures.index(signature)
+        except ValueError:
+            index = len(variants)
+            signatures.append(signature)
+            variants.append(device_field_value_rows(routers))
+        days[set_date] = index
+    return {"days": days, "variants": variants}
 
 
 def _feed_file_count(feed: FeedRecord) -> int:
@@ -157,6 +195,21 @@ def domain_trend_png(feed_series: list[list[int]], width: int = 300, height: int
     return "data:image/png;base64," + encoded
 
 
+def _domain_aimpoint_field(feed_router_lists, extractor) -> str:
+    """First non-empty aimpoint value across a domain's feeds' devices.
+
+    Mirrors ``table_data._first_feed_device_value`` (Current tab) — used for the
+    History domain master's Collection Region / Proxy columns.
+    """
+    for routers in feed_router_lists:
+        if not routers:
+            continue
+        value = extractor(_parse_aimpoint(routers[0]))
+        if value:
+            return value
+    return ""
+
+
 def domain_ids_with_history(repository: Repository) -> list[str]:
     """Return domain IDs present in the most recently completed history set."""
 
@@ -199,16 +252,17 @@ def build_feed_history_pivot(
 
     counts_by_feed: dict[str, dict[str, int]] = {}
     status_by_feed: dict[str, dict[str, str]] = {}
+    has_aimpoint: dict[str, bool] = {}
     for set_date in dates:
         for domain in repository.get_history_domains(set_date=set_date):
             if domain.domain_id != domain_id:
                 continue
             for feed in domain.feeds:
                 count = _feed_file_count(feed)
+                expected = _feed_expected(feed)
                 counts_by_feed.setdefault(feed.feed_id, {})[set_date] = count
-                status_by_feed.setdefault(feed.feed_id, {})[set_date] = cell_health_band(
-                    count, _feed_expected(feed)
-                )
+                status_by_feed.setdefault(feed.feed_id, {})[set_date] = cell_health_band(count, expected)
+                has_aimpoint[feed.feed_id] = has_aimpoint.get(feed.feed_id, False) or expected > 0
 
     columns: list[str] = [FEED_ID_COLUMN]
     for set_date in dates:
@@ -222,10 +276,20 @@ def build_feed_history_pivot(
     for feed_id in sorted(counts_by_feed):
         per_count = counts_by_feed[feed_id]
         per_status = status_by_feed[feed_id]
+        feed_gray = not has_aimpoint.get(feed_id, False)  # no aimpoint at all → gray
         row: dict[str, object] = {FEED_ID_COLUMN: feed_id}
         for set_date in dates:
-            row[set_date] = per_count.get(set_date)
-            row[f"{set_date}{STATUS_COLUMN_SUFFIX}"] = per_status.get(set_date)
+            count = per_count.get(set_date)
+            if count is None:
+                row[set_date] = None
+                status = None
+            else:
+                # No aimpoint → no files: default the count to 0. Nothing delivered
+                # (count 0) → gray, since there is nothing to assess.
+                shown = 0 if feed_gray else count
+                row[set_date] = shown
+                status = NONE_BAND if shown == 0 else per_status.get(set_date)
+            row[f"{set_date}{STATUS_COLUMN_SUFFIX}"] = status
         rows.append(row)
     return pd.DataFrame(rows, columns=columns)
 
@@ -266,16 +330,25 @@ def build_history_domain_master(
     latest_feed: dict[str, dict[str, FeedRecord]] = {}
     counts: dict[str, dict[str, dict[str, int]]] = {}
     bands: dict[str, dict[str, dict[str, str]]] = {}
+    # Whether a feed has an aimpoint on ANY day in the window (expected > 0). A
+    # feed with none is "no aimpoint at all" → gray.
+    has_aimpoint: dict[str, dict[str, bool]] = {}
+    # Stored routers per feed per day, for the per-day aimpoint detail.
+    day_routers: dict[str, dict[str, dict[str, tuple[DeviceRecord, ...]]]] = {}
     for set_date in dates:
         for domain in repository.get_history_domains(set_date=set_date):
             domain_id = domain.domain_id
             names.setdefault(domain_id, domain.domain_name)
             for feed in domain.feeds:
                 count = _feed_file_count(feed)
+                expected = _feed_expected(feed)
                 counts.setdefault(domain_id, {}).setdefault(feed.feed_id, {})[set_date] = count
                 bands.setdefault(domain_id, {}).setdefault(feed.feed_id, {})[set_date] = cell_health_band(
-                    count, _feed_expected(feed)
+                    count, expected
                 )
+                feed_seen = has_aimpoint.setdefault(domain_id, {})
+                feed_seen[feed.feed_id] = feed_seen.get(feed.feed_id, False) or expected > 0
+                day_routers.setdefault(domain_id, {}).setdefault(feed.feed_id, {})[set_date] = feed.routers
                 latest_feed.setdefault(domain_id, {}).setdefault(feed.feed_id, feed)
 
     if not names:
@@ -287,12 +360,41 @@ def build_history_domain_master(
     for domain_id in sorted(names, key=lambda d: names[d].lower()):
         feed_ids = sorted(counts.get(domain_id, {}))
 
+        def _no_aimpoint(feed_id: str) -> bool:
+            return not has_aimpoint[domain_id].get(feed_id, False)
+
+        def _day_count(feed_id: str, set_date: str) -> int | None:
+            """The delivered count shown for a feed on a day; ``None`` when absent.
+            A feed with no aimpoint at all delivers nothing that can be assessed,
+            so its cells default to 0 (no aimpoint → no files)."""
+            raw = counts[domain_id][feed_id].get(set_date)
+            if raw is None:
+                return None
+            return 0 if _no_aimpoint(feed_id) else int(raw)
+
+        def _day_band(feed_id: str, set_date: str) -> str | None:
+            """The cell band for a feed on a day; ``None`` for a day it was absent.
+
+            Gray ("none") when nothing was delivered that day (count 0 — including
+            a feed with no aimpoint at all), since there is nothing to assess.
+            """
+            count = _day_count(feed_id, set_date)
+            if count is None:
+                return None
+            if count == 0:
+                return NONE_BAND
+            return bands[domain_id][feed_id][set_date]
+
         # Worst color propagates upward (device cell → feed → domain). A feed's
         # band is the WORST of its day cells in the window, so any red day makes
-        # the feed — and thus the domain — red.
-        # Shrinking the window drops bad days, so a domain red over 30 days can
-        # be green over 10.
-        feed_window_bands = [rollup_band(bands[domain_id][feed_id].values()) for feed_id in feed_ids]
+        # the feed — and thus the domain — red. A feed with no aimpoint at all is
+        # gray ("none"); it never forces the domain, and a domain whose feeds are
+        # ALL no-aimpoint is itself gray. Shrinking the window drops bad days, so
+        # a domain red over 30 days can be green over 10.
+        feed_window_bands = [
+            rollup_band([b for b in (_day_band(feed_id, d) for d in dates) if b is not None])
+            for feed_id in feed_ids
+        ]
 
         summary = summarize_domain_bands(
             domain_id,
@@ -303,15 +405,12 @@ def build_history_domain_master(
 
         feed_rows: list[dict[str, object]] = []
         for feed_id in feed_ids:
-            per_count = counts[domain_id][feed_id]
-            per_band = bands[domain_id][feed_id]
             feed_row: dict[str, object] = {FEED_ID_COLUMN: feed_id}
             for set_date in dates:
-                count = per_count.get(set_date)
-                feed_row[set_date] = None if count is None else int(count)
-                feed_row[f"{set_date}{STATUS_COLUMN_SUFFIX}"] = per_band.get(set_date)
-            # Prefer the most recent (live) aimpoint for the device detail;
-            # fall back to the stored historical device row.
+                feed_row[set_date] = _day_count(feed_id, set_date)
+                feed_row[f"{set_date}{STATUS_COLUMN_SUFFIX}"] = _day_band(feed_id, set_date)
+            # Default device detail (no day selected): the most recent (live)
+            # aimpoint, falling back to the stored historical device row.
             routers = (live_routers or {}).get((domain_id, feed_id))
             if not routers:
                 routers = latest_feed[domain_id][feed_id].routers
@@ -319,11 +418,31 @@ def build_history_domain_master(
                 device_field_value_rows(routers),
                 separators=(",", ":"),
             )
+            # Per-day aimpoint: the STORED aimpoint for each specific day, so a
+            # clicked day shows that exact day's aimpoint — or "No aimpoint
+            # exists" if that day has none (no fall-back to a previous day).
+            feed_row["aimpoint_by_day_json"] = json.dumps(
+                _aimpoint_by_day(day_routers.get(domain_id, {}).get(feed_id, {})),
+                separators=(",", ":"),
+            )
             feed_rows.append(feed_row)
 
-        feed_series = domain_feed_series(counts.get(domain_id, {}), feed_ids, dates)
+        # Trend uses the same displayed counts (gray feeds contribute 0).
+        effective_counts = {
+            feed_id: {d: c for d in dates if (c := _day_count(feed_id, d)) is not None}
+            for feed_id in feed_ids
+        }
+        feed_series = domain_feed_series(effective_counts, feed_ids, dates)
+        # Collection Region / Proxy from any feed's device aimpoint (live-preferred,
+        # same source as the device detail), like the Current tab.
+        feed_router_lists = [
+            (live_routers or {}).get((domain_id, feed_id)) or latest_feed[domain_id][feed_id].routers
+            for feed_id in feed_ids
+        ]
         rows.append({
             **summary,
+            "coll_region": _domain_aimpoint_field(feed_router_lists, _aimpoint_coll_regions),
+            "proxy": _domain_aimpoint_field(feed_router_lists, _aimpoint_proxy),
             "feed_rows_json": json.dumps(feed_rows, separators=(",", ":")),
             "trend_img": domain_trend_png(feed_series),
         })

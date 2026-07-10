@@ -1,11 +1,14 @@
+import json
+from datetime import datetime, timezone
+
 from domain_feed_health_dashboard.data_model import DeviceRecord, DomainRecord, FeedRecord
 from domain_feed_health_dashboard.status import (
     band_overall_metrics,
     build_domain_band_summary,
     build_domain_summary,
     cell_health_band,
+    current_feed_band,
     domain_status_from_feeds,
-    feed_health_band,
     feed_status_counts,
     filter_domain_band_summary,
     rollup_band,
@@ -13,18 +16,55 @@ from domain_feed_health_dashboard.status import (
     status_from_count,
 )
 
+# noon UTC → 720 minutes elapsed → 720 // 15 = 48 files expected so far (24h op).
+_NOON = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+# 24-hour operation at the default 15-min interval (no "hours" → all day).
+_AIM_24H = {"deviceID": "d", "transcoderInterval": 15}
 
-def _band_feed(feed_id: str, count: int, expected: int) -> FeedRecord:
-    device = DeviceRecord(device_id=feed_id, files_expected=expected)
+
+def _cur_feed(feed_id: str, count: int, aimpoint: dict | None = None) -> FeedRecord:
+    routers = ()
+    if aimpoint is not None:
+        routers = (DeviceRecord(device_id=feed_id, aimpoint_json=json.dumps(aimpoint)),)
     return FeedRecord(
         feed_id=feed_id, status="yellow", count=count, location="", observed_time="t",
-        latitude=0.0, longitude=0.0, feed_type="", source_system="", routers=(device,),
+        latitude=0.0, longitude=0.0, feed_type="", source_system="", routers=routers,
     )
 
 
-def test_feed_health_band_migrates_with_count():
-    bands = [feed_health_band(_band_feed("f", count, 96)) for count in (0, 50, 75, 90, 96, 100)]
-    assert bands == ["red", "red", "orange", "yellow", "green", "red"]
+def test_current_feed_band_is_green_when_count_matches_expected_so_far():
+    assert current_feed_band(_cur_feed("f", 48, _AIM_24H), _NOON) == "green"
+
+
+def test_current_feed_band_allows_plus_or_minus_one_tolerance():
+    # Off by one (either direction) still counts as green — timing jitter grace.
+    assert current_feed_band(_cur_feed("f", 49, _AIM_24H), _NOON) == "green"
+    assert current_feed_band(_cur_feed("f", 47, _AIM_24H), _NOON) == "green"
+
+
+def test_current_feed_band_is_yellow_beyond_tolerance_never_red():
+    # More than ±1 off → yellow (never red), either direction.
+    assert current_feed_band(_cur_feed("f", 50, _AIM_24H), _NOON) == "yellow"
+    assert current_feed_band(_cur_feed("f", 46, _AIM_24H), _NOON) == "yellow"
+
+
+def test_current_feed_band_is_gray_when_nothing_delivered():
+    # A zero file count is gray (nothing to assess) — e.g. a configured device
+    # that isn't producing — at any time of day.
+    midnight = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    assert current_feed_band(_cur_feed("f", 0, _AIM_24H), midnight) == "none"
+    assert current_feed_band(_cur_feed("f", 0, _AIM_24H), _NOON) == "none"
+
+
+def test_current_feed_band_is_gray_without_aimpoint():
+    assert current_feed_band(_cur_feed("f", 5), _NOON) == "none"
+
+
+def test_current_feed_band_respects_operating_hours():
+    # 09:00-18:00 window; at 12:00 that tz, 180 min elapsed → 12 files expected.
+    aim = {"deviceID": "d", "transcoderInterval": 15, "hours": {"tz": "UTC", "hrs": ["0900-1800"]}}
+    assert current_feed_band(_cur_feed("f", 12, aim), _NOON) == "green"
+    assert current_feed_band(_cur_feed("f", 20, aim), _NOON) == "yellow"
 
 
 def test_rollup_band_is_worst_feed():
@@ -33,45 +73,72 @@ def test_rollup_band_is_worst_feed():
     assert rollup_band([]) == "red"          # no feeds → no delivery
 
 
-def test_build_domain_band_summary_counts_each_band():
+def test_rollup_band_none_is_non_contributing_but_all_none_is_none():
+    # "none" (no aimpoint) never wins against a real band...
+    assert rollup_band(["green", "none"]) == "green"
+    assert rollup_band(["none", "red"]) == "red"
+    # ...but when every child is "none" the rollup is gray, not red.
+    assert rollup_band(["none", "none"]) == "none"
+
+
+def test_none_band_has_an_icon():
+    from domain_feed_health_dashboard.status import BAND_ICONS, NONE_BAND
+    assert NONE_BAND == "none"
+    assert "none" in BAND_ICONS
+
+
+def test_filter_treats_none_as_a_first_class_band_option():
+    import pandas as pd
+    summary = pd.DataFrame([
+        {"domain_id": "d1", "domain_name": "gray", "domain_band": "none", "red_feeds": 0},
+        {"domain_id": "d2", "domain_name": "grn", "domain_band": "green", "red_feeds": 0},
+    ])
+    # "none" is a selectable filter box → it filters like any other band.
+    assert filter_domain_band_summary(summary, "", ["none"], False) == {"d1"}
+    assert filter_domain_band_summary(summary, "", ["green"], False) == {"d2"}
+    assert filter_domain_band_summary(summary, "", ["green", "none"], False) == {"d1", "d2"}
+
+
+def test_none_is_a_filter_option():
+    from domain_feed_health_dashboard.status import BAND_OPTIONS
+    assert "none" in BAND_OPTIONS
+
+
+def test_current_domain_band_is_worst_feed_and_never_red():
+    # One green feed + one deviating (yellow) feed → domain yellow (worst wins).
     domain = DomainRecord(
         domain_name="d1", domain_id="d1", last_observed_time="t",
-        feeds=(_band_feed("a", 96, 96), _band_feed("b", 75, 96), _band_feed("c", 50, 96)),
+        feeds=(_cur_feed("a", 48, _AIM_24H), _cur_feed("b", 40, _AIM_24H)),
     )
-    row = build_domain_band_summary((domain,)).iloc[0]
-    assert row["domain_band"] == "red"       # worst of green/orange/red
-    assert (row["green_feeds"], row["orange_feeds"], row["red_feeds"]) == (1, 1, 1)
+    row = build_domain_band_summary((domain,), _NOON).iloc[0]
+    assert row["domain_band"] == "yellow"
+    assert (row["green_feeds"], row["yellow_feeds"], row["red_feeds"]) == (1, 1, 0)
 
-
-def test_current_tab_domain_band_propagates_worst_feed():
-    # Lowest color propagates up on the Current tab too: one red feed among
-    # green feeds makes the domain red (parity with the history tab).
-    domain = DomainRecord(
-        domain_name="d1", domain_id="d1", last_observed_time="t",
-        feeds=(_band_feed("goodcam", 96, 96), _band_feed("worldcam", 30, 96)),
-    )
-    row = build_domain_band_summary((domain,)).iloc[0]
-    assert row["domain_band"] == "red"
-    assert (row["green_feeds"], row["red_feeds"]) == (1, 1)
-
-    # The worst band is preserved, not collapsed to red: green + orange → orange.
-    orangeish = DomainRecord(
+    all_green = DomainRecord(
         domain_name="d2", domain_id="d2", last_observed_time="t",
-        feeds=(_band_feed("a", 96, 96), _band_feed("b", 75, 96)),
+        feeds=(_cur_feed("a", 48, _AIM_24H), _cur_feed("b", 48, _AIM_24H)),
     )
-    assert build_domain_band_summary((orangeish,)).iloc[0]["domain_band"] == "orange"
+    assert build_domain_band_summary((all_green,), _NOON).iloc[0]["domain_band"] == "green"
+
+
+def test_current_domain_is_gray_when_no_aimpoint_at_all():
+    domain = DomainRecord(
+        domain_name="d1", domain_id="d1", last_observed_time="t",
+        feeds=(_cur_feed("a", 5), _cur_feed("b", 0)),  # no aimpoints
+    )
+    assert build_domain_band_summary((domain,), _NOON).iloc[0]["domain_band"] == "none"
 
 
 def test_band_overall_metrics_and_filter():
     domains = (
-        DomainRecord(domain_name="alpha", domain_id="d1", last_observed_time="t", feeds=(_band_feed("a", 96, 96),)),
-        DomainRecord(domain_name="beta", domain_id="d2", last_observed_time="t", feeds=(_band_feed("b", 75, 96),)),
+        DomainRecord(domain_name="alpha", domain_id="d1", last_observed_time="t", feeds=(_cur_feed("a", 48, _AIM_24H),)),   # green
+        DomainRecord(domain_name="beta", domain_id="d2", last_observed_time="t", feeds=(_cur_feed("b", 40, _AIM_24H),)),    # yellow
     )
-    summary = build_domain_band_summary(domains)
+    summary = build_domain_band_summary(domains, _NOON)
     metrics = band_overall_metrics(summary)
-    assert metrics["green_domains"] == 1 and metrics["orange_domains"] == 1
+    assert metrics["green_domains"] == 1 and metrics["yellow_domains"] == 1
     # Status filter limits to the requested bands; search matches domain name.
-    assert filter_domain_band_summary(summary, "", ["orange"], False) == {"d2"}
+    assert filter_domain_band_summary(summary, "", ["yellow"], False) == {"d2"}
     assert filter_domain_band_summary(summary, "alph", [], False) == {"d1"}
 
 

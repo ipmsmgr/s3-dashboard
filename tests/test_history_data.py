@@ -14,6 +14,7 @@ from domain_feed_health_dashboard.history_data import (
     DEFAULT_HISTORY_WINDOW_DAYS,
     MAX_HISTORY_WINDOW_DAYS,
     MIN_HISTORY_WINDOW_DAYS,
+    _aimpoint_by_day,
     build_feed_history_pivot,
     build_history_domain_master,
     domain_feed_series,
@@ -255,14 +256,88 @@ def test_history_master_trend_img_is_a_png_data_uri(seeded_repository):
     assert master_df.iloc[0]["trend_img"].startswith("data:image/png;base64,")
 
 
+def test_history_no_aimpoint_feed_is_gray_but_domain_keeps_real_band(tmp_path):
+    db_path = tmp_path / "mixed.sqlite3"
+    conn = open_db(db_path)
+    # FEED-A has a device (green); FEED-NOAIM has no device at all (like rdtc15).
+    _seed_day(
+        conn, "2026-06-17", "DOMAIN-1", {"FEED-A": "green", "FEED-NOAIM": "green"},
+        device_files={"FEED-A": (96, 96)},
+    )
+    conn.close()
+    master, _ = build_history_domain_master(Repository(db_path))
+    row = master.iloc[0]
+    # A real feed exists → domain colored normally (gray never wins).
+    assert row["domain_band"] == "green"
+    feeds = {r["feed_id"]: r for r in json.loads(row["feed_rows_json"])}
+    # No-aimpoint feed's day cell is gray ("none"), its count defaults to 0
+    # (no aimpoint → no files), and it has no per-day aimpoint (any day click → placeholder).
+    assert feeds["FEED-NOAIM"]["2026-06-17__status"] == "none"
+    assert feeds["FEED-NOAIM"]["2026-06-17"] == 0
+    assert json.loads(feeds["FEED-NOAIM"]["aimpoint_by_day_json"])["days"] == {}
+    # The feed with a device keeps its real band.
+    assert feeds["FEED-A"]["2026-06-17__status"] == "green"
+
+
+def test_history_master_has_collection_region_and_proxy_from_aimpoint(tmp_path):
+    db_path = tmp_path / "cr.sqlite3"
+    conn = open_db(db_path)
+    _seed_day(conn, "2026-06-19", "DOMAIN-001", {"FEED-001": "green"}, device_files={"FEED-001": (96, 96)})
+    conn.close()
+    live = DeviceRecord(
+        device_id="FEED-001",
+        aimpoint_json=json.dumps(
+            {"deviceID": "FEED-001", "collRegions": ["United States (N. Virginia)"], "proxy": "px.host:8080"}
+        ),
+    )
+    master, _ = build_history_domain_master(
+        Repository(db_path), live_routers={("DOMAIN-001", "FEED-001"): (live,)}
+    )
+    row = master.iloc[0]
+    assert row["coll_region"] == "United States (N. Virginia)"
+    assert row["proxy"] == "px.host:8080"
+
+
+def test_history_domain_all_no_aimpoint_is_gray(tmp_path):
+    db_path = tmp_path / "allgray.sqlite3"
+    conn = open_db(db_path)
+    _seed_day(conn, "2026-06-17", "DOMAIN-1", {"FEED-X": "green"})  # no device at all
+    conn.close()
+    master, _ = build_history_domain_master(Repository(db_path))
+    assert master.iloc[0]["domain_band"] == "none"
+
+
+def test_aimpoint_by_day_maps_each_day_with_dedup_and_no_fallback():
+    def dev(ct):
+        return (DeviceRecord(device_id="D", aimpoint_json=json.dumps({"deviceID": "D", "collectionType": ct})),)
+    routers_by_day = {
+        "2026-06-17": dev("RTSP"),   # different aimpoint
+        "2026-06-16": dev("M3U"),    # same as 06-15
+        "2026-06-15": dev("M3U"),
+        "2026-06-14": (),            # no aimpoint that day
+    }
+    result = _aimpoint_by_day(routers_by_day)
+    # Only days that actually have an aimpoint are mapped (06-14 is absent → no fallback).
+    assert set(result["days"]) == {"2026-06-15", "2026-06-16", "2026-06-17"}
+    # 06-15 and 06-16 share one deduped variant; 06-17 is a different variant.
+    assert result["days"]["2026-06-15"] == result["days"]["2026-06-16"]
+    assert result["days"]["2026-06-17"] != result["days"]["2026-06-15"]
+    assert len(result["variants"]) == 2
+    assert result["variants"][result["days"]["2026-06-17"]][0] == {"field": "Device ID", "value": "D"}
+
+
+def test_aimpoint_by_day_empty_when_no_stored_aimpoint():
+    assert _aimpoint_by_day({"2026-06-17": ()}) == {"days": {}, "variants": []}
+
+
 def test_history_domain_band_propagates_worst_cell_over_the_window(tmp_path):
     # Lowest color propagates up: a feed that delivers fully on most days but
-    # gets 0 files on one day has a red cell, so the feed — and the domain — is
-    # red whenever that day is in the window, even though the average is high.
-    # Excluding the bad day (shorter window) makes it green.
+    # under-delivers on one (50/96 = 52% → red) has a red cell, so the feed — and
+    # the domain — is red whenever that day is in the window, even though the
+    # average is high. Excluding the bad day (shorter window) makes it green.
     db_path = tmp_path / "window.sqlite3"
     conn = open_db(db_path)
-    _seed_day(conn, "2026-06-10", "DOMAIN-001", {"FEED-001": "red"}, device_files={"FEED-001": (0, 96)})
+    _seed_day(conn, "2026-06-10", "DOMAIN-001", {"FEED-001": "red"}, device_files={"FEED-001": (50, 96)})
     _seed_day(conn, "2026-06-18", "DOMAIN-001", {"FEED-001": "green"}, device_files={"FEED-001": (96, 96)})
     _seed_day(conn, "2026-06-19", "DOMAIN-001", {"FEED-001": "green"}, device_files={"FEED-001": (96, 96)})
     conn.close()
@@ -273,6 +348,22 @@ def test_history_domain_band_propagates_worst_cell_over_the_window(tmp_path):
     assert short_window.iloc[0]["domain_band"] == "green"   # only green cells in window
     assert wide_window.iloc[0]["domain_band"] == "red"       # one red cell propagates up
     assert wide_window.iloc[0]["red_feeds"] == 1             # the feed itself counts as red
+
+
+def test_history_zero_delivery_day_is_gray_not_red(tmp_path):
+    # A day that delivered nothing is gray (nothing to assess) and, being
+    # non-contributing, does not drag the domain to red.
+    db_path = tmp_path / "zero.sqlite3"
+    conn = open_db(db_path)
+    _seed_day(conn, "2026-06-18", "DOMAIN-001", {"FEED-001": "red"}, device_files={"FEED-001": (0, 96)})
+    _seed_day(conn, "2026-06-19", "DOMAIN-001", {"FEED-001": "green"}, device_files={"FEED-001": (96, 96)})
+    conn.close()
+    master, _ = build_history_domain_master(Repository(db_path), max_days=2)
+    row = master.iloc[0]
+    feed = json.loads(row["feed_rows_json"])[0]
+    assert feed["2026-06-18"] == 0 and feed["2026-06-18__status"] == "none"   # gray
+    assert feed["2026-06-19__status"] == "green"
+    assert row["domain_band"] == "green"   # gray never wins the rollup
 
 
 def test_history_device_detail_prefers_live_aimpoint(tmp_path):

@@ -11,6 +11,7 @@ Rollup rules
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from typing import Iterable, Optional
 
@@ -96,13 +97,25 @@ def cell_health_band(actual: int, expected: int) -> str:
 # percentage band (cell_health_band), not the 3-level stored feed.status. Bands
 # add "orange" (70-79%) between yellow and red. The 3-level helpers above remain
 # for the SQLite write path (db/schema feed_status, domain_sets rollups).
+# "none" (gray) is a non-health state meaning "no aimpoint exists at all", so the
+# delivery rate cannot be assessed. It has no severity (0) — it never wins a
+# rollup against a real band — but when EVERY band in a rollup is "none" the
+# result is "none" (a gray feed/domain), distinct from "red" (broken delivery).
+NONE_BAND = "none"
+# Current tab: how far the delivered count may sit from the expected-so-far count
+# and still be green — a one-file grace for delivery timing around an interval.
+CURRENT_BAND_TOLERANCE = 1
 BAND_SEVERITY: dict[str, int] = {"green": 1, "yellow": 2, "orange": 3, "red": 4}
-BAND_OPTIONS = ["green", "yellow", "orange", "red"]
+# Domain-status filter options (sidebar), including "none" (gray = no aimpoint).
+BAND_OPTIONS = ["green", "yellow", "orange", "red", "none"]
+# Filter labels: a colored box + the percentage range only (no color words); the
+# gray "no aimpoint" box reads 0%.
 BAND_ICONS: dict[str, str] = {
-    "green": "🟢 GREEN / 95-100%",
-    "yellow": "🟡 YELLOW / 80-94%",
-    "orange": "🟠 ORANGE / 70-79%",
-    "red": "🔴 RED / <70% or >100%",
+    "green": "🟢 95-100%",
+    "yellow": "🟡 80-94%",
+    "orange": "🟠 70-79%",
+    "red": "🔴 <70% or >100%",
+    "none": "⚪ 0%",
 }
 BAND_SUMMARY_COLUMNS = [
     "domain_id", "domain_name", "domain_band", "status_label",
@@ -112,19 +125,62 @@ BAND_SUMMARY_COLUMNS = [
 
 
 def rollup_band(bands: Iterable[str]) -> str:
-    """Domain band = worst feed band (red worst). No feeds → red (no delivery)."""
+    """Worst-wins rollup of child bands (red worst), ignoring ``"none"``.
+
+    ``"none"`` (no aimpoint) is non-contributing, so a real band always wins.
+    When there are child bands but ALL of them are ``"none"`` the rollup is
+    ``"none"`` (a gray feed/domain — no aimpoint at all). With no child bands at
+    all the rollup is ``"red"`` (no delivery).
+    """
+    bands = list(bands)
     worst = 0
     for band in bands:
         worst = max(worst, BAND_SEVERITY.get(band, 0))
-    if worst == 0:
-        return "red"
-    return next(b for b, v in BAND_SEVERITY.items() if v == worst)
+    if worst > 0:
+        return next(b for b, v in BAND_SEVERITY.items() if v == worst)
+    if bands:  # children exist but every one is "none" → gray, not red
+        return NONE_BAND
+    return "red"  # no feeds/cells at all → no delivery
 
 
-def feed_health_band(feed: FeedRecord) -> str:
-    """Current-tab feed band: today's delivered count vs. the device's expected."""
-    expected = feed.routers[0].files_expected if feed.routers else 0
-    return cell_health_band(feed.count, expected)
+def current_feed_band(feed: FeedRecord, now=None) -> str:
+    """Current-tab feed band: green / yellow / gray, never red.
+
+    A feed is green while the delivered count is within ±1 of the files expected
+    *by now* (from the aimpoint's operating hours, see
+    ``log_parser.expected_file_count_so_far``) — a one-file tolerance absorbs
+    normal timing jitter around a transcoder-interval boundary. A larger
+    deviation (extra or missing files for the current time) is ``"yellow"``.
+
+    A feed is ``"none"`` (gray) when there is nothing to assess: **no files
+    delivered** (count 0 — e.g. a configured device that isn't producing), or no
+    aimpoint available. ``now`` defaults to the current time.
+    """
+    try:
+        if int(feed.count) == 0:
+            return NONE_BAND        # nothing delivered → nothing to assess
+    except (TypeError, ValueError):
+        return NONE_BAND
+
+    routers = feed.routers
+    if not routers or not routers[0].aimpoint_json:
+        return NONE_BAND
+    # Imported lazily: log_parser imports this module (status), so a top-level
+    # import here would be circular.
+    from domain_feed_health_dashboard.services.log_parser import expected_file_count_so_far
+
+    try:
+        aimpoint = json.loads(routers[0].aimpoint_json)
+    except (json.JSONDecodeError, TypeError):
+        return NONE_BAND
+    if not isinstance(aimpoint, dict):
+        return NONE_BAND
+    expected = expected_file_count_so_far(aimpoint, now)
+    try:
+        actual = int(feed.count)
+    except (TypeError, ValueError):
+        actual = 0
+    return "green" if abs(actual - expected) <= CURRENT_BAND_TOLERANCE else "yellow"
 
 
 def summarize_domain_bands(
@@ -150,13 +206,18 @@ def summarize_domain_bands(
     }
 
 
-def build_domain_band_summary(domains: Iterable[DomainRecord]) -> pd.DataFrame:
-    """Band-based domain summary for the Current tab (one row per domain)."""
+def build_domain_band_summary(domains: Iterable[DomainRecord], now=None) -> pd.DataFrame:
+    """Band-based domain summary for the Current tab (one row per domain).
+
+    Feed bands are green / yellow / gray (never red), and the domain is the worst
+    (yellow > green); a domain whose feeds are all gray (no aimpoint) is gray.
+    ``now`` is threaded to :func:`current_feed_band` for deterministic tests.
+    """
     rows = [
         summarize_domain_bands(
             domain.domain_id or domain.domain_name,
             domain.domain_name,
-            [feed_health_band(feed) for feed in domain.feeds],
+            [current_feed_band(feed, now) for feed in domain.feeds],
             domain.last_observed_time,
         )
         for domain in domains
@@ -191,12 +252,13 @@ def filter_domain_band_summary(
     summary: pd.DataFrame,
     search_text: str,
     selected_bands: list[str],
-    only_red_feeds: bool,
+    only_red_feeds: bool = False,
 ) -> set[str]:
     """Return the set of visible ``domain_id``s after applying sidebar filters.
 
-    Shared by both tabs so the Search / status / "only red feeds" widgets apply
-    to the Current and Historical views alike.
+    Shared by both tabs so the Search / status-filter widgets apply to the
+    Current and Historical views alike. ``only_red_feeds`` is retained (default
+    off) for callers/tests, though the sidebar checkbox that drove it was removed.
     """
     if summary.empty:
         return set()
@@ -206,6 +268,8 @@ def filter_domain_band_summary(
         matching = summary[summary["domain_name"].str.lower().str.contains(needle, regex=False)]
         visible &= set(matching["domain_id"].tolist())
     if selected_bands:
+        # "none" (no-aimpoint / gray) is now a first-class filter option, so it
+        # filters like any other band.
         matching = summary[summary["domain_band"].isin(set(selected_bands))]
         visible &= set(matching["domain_id"].tolist())
     if only_red_feeds:

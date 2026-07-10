@@ -47,9 +47,12 @@ def test_domain_grid_headers():
     assert cols["status_label"].get("hide") is True
     assert cols["domain_name"].get("cellStyle") is not None
     assert cols["total_feeds"]["headerName"] == "Total Feeds"
-    assert cols["red_feeds"]["headerName"] == "Red"
-    assert cols["yellow_feeds"]["headerName"] == "Yellow"
     assert cols["green_feeds"]["headerName"] == "Green"
+    assert cols["yellow_feeds"]["headerName"] == "Yellow"
+    # Current tab is green/yellow/gray only → Orange/Red columns hidden (kept in
+    # the data for possible future use).
+    assert cols["orange_feeds"].get("hide") is True
+    assert cols["red_feeds"].get("hide") is True
     # "Last Checked" and "Expanded feed rows" are removed from the domain master.
     assert cols["last_observed_time"].get("hide") is True
     assert cols["displayed_feed_rows"].get("hide") is True
@@ -132,6 +135,8 @@ def _history_master_df():
                 "yellow_feeds": 1,
                 "green_feeds": 0,
                 "last_observed_time": "2026-06-17T00:00:00+00:00",
+                "coll_region": "United States (N. Virginia)",
+                "proxy": "px.host:8080",
                 "feed_rows_json": "[]",
                 "trend_img": "data:image/png;base64,AAAA",
             }
@@ -161,6 +166,41 @@ def test_build_history_master_detail_nests_domain_feed_pivot_and_device():
     # Second-level detail = device aimpoint Field/Value grid.
     device_grid = feed_grid["detailCellRendererParams"]["detailGridOptions"]
     assert [c["field"] for c in device_grid["columnDefs"]] == ["field", "value"]
+
+
+def test_history_feed_pivot_supports_per_day_aimpoint_click():
+    from domain_feed_health_dashboard.grid_config import (
+        DOMAIN_BAND_STYLE_JS,
+        HISTORY_CELL_STYLE_JS,
+    )
+    options = build_history_master_detail_grid_options(
+        _history_master_df(), [("2026-06-17", "6/17"), ("2026-06-16", "6/16")]
+    )
+    feed_grid = options["detailCellRendererParams"]["detailGridOptions"]
+    # A day-cell click (not a plain row click) drives which day's aimpoint shows.
+    assert "onCellClicked" in feed_grid
+    assert "onRowClicked" not in feed_grid
+    # The per-day aimpoint change-points are carried (hidden) on each feed row.
+    fields = {c["field"]: c for c in feed_grid["columnDefs"]}
+    assert fields["aimpoint_by_day_json"]["hide"] is True
+    assert feed_grid["detailCellRendererParams"]["getDetailRowData"] is not None
+    # No-aimpoint cells / domains render gray ("none").
+    assert "none" in HISTORY_CELL_STYLE_JS and "#e5e7eb" in HISTORY_CELL_STYLE_JS
+    assert "none" in DOMAIN_BAND_STYLE_JS
+
+
+def test_history_master_columns_flex_with_trend_one_and_a_half():
+    options = build_history_master_detail_grid_options(
+        _history_master_df(), [("2026-06-17", "6/17")]
+    )
+    cols = {c["field"]: c for c in options["columnDefs"]}
+    # Count columns stretch to fill the width (flex), and Trend is 1.5× them.
+    assert cols["total_feeds"].get("flex") == 1
+    assert cols["red_feeds"].get("flex") == 1
+    assert cols["trend_img"].get("flex") == 1.5
+    # Collection Region / Proxy columns (from the aimpoint) sit between Red and Trend.
+    assert cols["coll_region"]["headerName"] == "Collection Region"
+    assert cols["proxy"]["headerName"] == "Proxy"
 
 
 def test_history_master_has_trend_sparkline_column():

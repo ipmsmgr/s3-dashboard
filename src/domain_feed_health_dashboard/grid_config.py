@@ -18,9 +18,9 @@ except ImportError:  # pragma: no cover - lets tests run in minimal environments
     JsCode = None  # type: ignore[assignment]
 
 
-# Colors a Current-tab feed cell (Status, File Count) by its hidden "band"
-# field — the delivered-vs-expected percentage band (green/yellow/orange/red),
-# so the color migrates as the day's count grows toward expected.
+# Colors a Current-tab feed cell (File Count) by its hidden "band" field. On the
+# Current tab the band is green (delivered == expected-so-far), yellow (any
+# deviation), or gray "none" (no aimpoint) — never red (see status.current_feed_band).
 BAND_CELL_STYLE_JS = """
 function(params) {
     var band = params.data ? params.data.band : null;
@@ -28,6 +28,7 @@ function(params) {
     if (band === 'orange') { return {'backgroundColor': '#f97316', 'color': '#7c2d12', 'fontWeight': '700'}; }
     if (band === 'yellow') { return {'backgroundColor': '#facc15', 'color': '#422006', 'fontWeight': '700'}; }
     if (band === 'green') { return {'backgroundColor': '#16a34a', 'color': '#ffffff', 'fontWeight': '700'}; }
+    if (band === 'none') { return {'backgroundColor': '#e5e7eb', 'color': '#6b7280'}; }
     return null;
 }
 """
@@ -42,6 +43,7 @@ function(params) {
     if (band === 'orange') { return {'backgroundColor': '#f97316', 'color': '#7c2d12', 'fontWeight': '700'}; }
     if (band === 'yellow') { return {'backgroundColor': '#facc15', 'color': '#422006', 'fontWeight': '700'}; }
     if (band === 'green') { return {'backgroundColor': '#16a34a', 'color': '#ffffff', 'fontWeight': '700'}; }
+    if (band === 'none') { return {'backgroundColor': '#e5e7eb', 'color': '#6b7280', 'fontWeight': '700'}; }
     return null;
 }
 """
@@ -65,6 +67,9 @@ function(params) {{
     if (status === 'green') {{
         return {{'backgroundColor': '#16a34a', 'color': '#ffffff', 'fontWeight': '700'}};
     }}
+    if (status === 'none') {{
+        return {{'backgroundColor': '#e5e7eb', 'color': '#6b7280'}};
+    }}
     return null;
 }}
 """
@@ -84,7 +89,7 @@ function(params) {
         'backgroundImage': 'url("' + params.value + '")',
         'backgroundRepeat': 'no-repeat',
         'backgroundPosition': 'center',
-        'backgroundSize': 'contain'
+        'backgroundSize': '100% 100%'
     };
 }
 """
@@ -155,6 +160,56 @@ function(event) {
 """
 
 
+# History feed×day pivot: a click on a DAY cell opens (or refreshes) the device
+# detail for that specific day; a click on the feed-id (or any non-day) cell
+# clears the day and toggles the detail with the default (most recent) aimpoint.
+# Re-expanding forces getDetailRowData to recompute for the chosen day.
+HISTORY_FEED_PIVOT_CELL_CLICK_JS = """
+function(event) {
+    var node = event.node;
+    if (!node || !node.master) { return; }
+    var field = event.column ? event.column.getColId() : '';
+    if (/^\\d{4}-\\d{2}-\\d{2}$/.test(field)) {
+        node.data._selected_day = field;
+        node.setExpanded(false);
+        node.setExpanded(true);
+    } else {
+        node.data._selected_day = null;
+        node.setExpanded(!node.expanded);
+    }
+}
+"""
+
+
+# History device detail: resolves the aimpoint rows for the clicked day.
+# With a selected day, show that EXACT day's stored aimpoint (aimpoint_by_day),
+# or "No aimpoint exists" if that day has none (no fall-back to a previous day).
+# With no day selected, use the default (current/most-recent) router_rows_json.
+HISTORY_DETAIL_GET_ROUTER_ROWS_JS = """
+function(params) {
+    var placeholder = [{field: 'Aimpoint', value: 'No aimpoint exists'}];
+    try {
+        var data = params.data || {};
+        var day = data._selected_day;
+        var rows = null;
+        if (day) {
+            var byDay = data.aimpoint_by_day_json ? JSON.parse(data.aimpoint_by_day_json) : {};
+            var days = byDay.days || {};
+            if (Object.prototype.hasOwnProperty.call(days, day)) {
+                rows = (byDay.variants || [])[days[day]] || null;
+            }
+        } else {
+            rows = data.router_rows_json ? JSON.parse(data.router_rows_json) : null;
+        }
+        if (!Array.isArray(rows) || rows.length === 0) { rows = placeholder; }
+        params.successCallback(rows);
+    } catch (error) {
+        params.successCallback(placeholder);
+    }
+}
+"""
+
+
 def aggrid_available() -> bool:
     """Return whether streamlit-aggrid is importable in this runtime."""
 
@@ -183,12 +238,16 @@ def _base_builder(data: pd.DataFrame, row_id_column: str) -> Any:
     return builder
 
 
-def _configure_domain_band_columns(builder: Any) -> None:
+def _configure_domain_band_columns(builder: Any, *, count_flex: float | None = None) -> None:
     """Configure the shared domain master columns for both tabs.
 
     Domain / Total Feeds / Green / Yellow / Orange / Red / Last Checked. There is
     no separate Status column — the Domain (first) cell itself is coloured by the
     hidden ``domain_band`` (worst feed band).
+
+    ``count_flex`` gives the count columns a proportional ``flex`` width (instead
+    of fixed pixels) so they stretch to fill the grid — used by the Historical
+    tab. When ``None`` (Current tab) they keep compact fixed widths.
     """
     # NOTE: GridOptionsBuilder.configure_column() overwrites headerName back to
     # the field name on every call that omits header_name, so a field that
@@ -203,11 +262,21 @@ def _configure_domain_band_columns(builder: Any) -> None:
     )
     builder.configure_column("status_label", hide=True)
     builder.configure_column("domain_band", hide=True)
-    builder.configure_column("total_feeds", header_name="Total Feeds", type=["numericColumn"], width=120)
-    builder.configure_column("green_feeds", header_name="Green", type=["numericColumn"], width=100)
-    builder.configure_column("yellow_feeds", header_name="Yellow", type=["numericColumn"], width=100)
-    builder.configure_column("orange_feeds", header_name="Orange", type=["numericColumn"], width=100)
-    builder.configure_column("red_feeds", header_name="Red", type=["numericColumn"], width=90)
+    if count_flex is None:
+        builder.configure_column("total_feeds", header_name="Total Feeds", type=["numericColumn"], width=120)
+        builder.configure_column("green_feeds", header_name="Green", type=["numericColumn"], width=100)
+        builder.configure_column("yellow_feeds", header_name="Yellow", type=["numericColumn"], width=100)
+        builder.configure_column("orange_feeds", header_name="Orange", type=["numericColumn"], width=100)
+        builder.configure_column("red_feeds", header_name="Red", type=["numericColumn"], width=90)
+    else:
+        # minWidth is sized to fit each header label (incl. the sort/padding) so
+        # the full text always shows without manual widening; flex still lets the
+        # columns grow to fill extra width.
+        builder.configure_column("total_feeds", header_name="Total Feeds", type=["numericColumn"], flex=count_flex, minWidth=135)
+        builder.configure_column("green_feeds", header_name="Green", type=["numericColumn"], flex=count_flex, minWidth=95)
+        builder.configure_column("yellow_feeds", header_name="Yellow", type=["numericColumn"], flex=count_flex, minWidth=100)
+        builder.configure_column("orange_feeds", header_name="Orange", type=["numericColumn"], flex=count_flex, minWidth=105)
+        builder.configure_column("red_feeds", header_name="Red", type=["numericColumn"], flex=count_flex, minWidth=90)
     # "Last Checked" is hidden on both tabs (no timestamp column in the domain master).
     builder.configure_column("last_observed_time", hide=True)
 
@@ -305,6 +374,11 @@ def build_domain_master_detail_grid_options(data: pd.DataFrame) -> dict[str, Any
 
     builder = _base_builder(data, row_id_column="domain_id")
     _configure_domain_band_columns(builder)
+    # Current tab is never orange/red (green/yellow/gray only — see
+    # status.current_feed_band), so hide the Orange/Red count columns. The data
+    # is still present on the row (just hidden) in case they're needed later.
+    builder.configure_column("orange_feeds", hide=True)
+    builder.configure_column("red_feeds", hide=True)
     # Populated from any of the domain's feed devices (aimpoint collRegions / proxy).
     builder.configure_column("coll_region", header_name="Collection Region", minWidth=190)
     builder.configure_column("proxy", header_name="Proxy", minWidth=170)
@@ -331,8 +405,11 @@ def _history_feed_pivot_detail_grid_options(date_headers: list[tuple[str, str]])
     """Feed×day pivot as a master/detail child grid (the History domain's feeds).
 
     One pinned Feed ID column and one count column per day (newest-first), cells
-    coloured by the delivered-vs-expected band. Each feed row is itself
-    expandable to its device's aimpoint Field/Value rows (``router_rows_json``).
+    coloured by the delivered-vs-expected band (gray when the feed has no
+    aimpoint at all). Each feed row is expandable to its device's aimpoint
+    Field/Value rows: clicking a specific DAY cell shows that exact day's aimpoint
+    (``aimpoint_by_day_json``), and clicking the feed id shows the default most
+    recent aimpoint (``router_rows_json``).
     """
     cell_style = JsCode(HISTORY_CELL_STYLE_JS) if JsCode is not None else None
     count_formatter = JsCode(HISTORY_COUNT_FORMATTER_JS) if JsCode is not None else None
@@ -354,6 +431,7 @@ def _history_feed_pivot_detail_grid_options(date_headers: list[tuple[str, str]])
         column_defs.append(day_column)
         column_defs.append({"field": f"{field}{STATUS_COLUMN_SUFFIX}", "hide": True})
     column_defs.append({"field": "router_rows_json", "hide": True})
+    column_defs.append({"field": "aimpoint_by_day_json", "hide": True})
 
     options: dict[str, Any] = {
         # autoHeight so this pivot grows to all feeds (and its own expanded
@@ -373,10 +451,11 @@ def _history_feed_pivot_detail_grid_options(date_headers: list[tuple[str, str]])
                 "detailRowHeight": 320,
                 "detailRowAutoHeight": True,
                 "isRowMaster": JsCode("function(dataItem) { return true; }"),
-                "onRowClicked": JsCode(FEED_ROW_CLICK_EXPAND_JS),
+                # Per-day: a day-cell click drives which day's aimpoint shows.
+                "onCellClicked": JsCode(HISTORY_FEED_PIVOT_CELL_CLICK_JS),
                 "detailCellRendererParams": {
                     "detailGridOptions": _router_detail_grid_options(),
-                    "getDetailRowData": JsCode(DETAIL_GET_ROUTER_ROWS_JS),
+                    "getDetailRowData": JsCode(HISTORY_DETAIL_GET_ROUTER_ROWS_JS),
                 },
             }
         )
@@ -400,7 +479,13 @@ def build_history_master_detail_grid_options(data: pd.DataFrame, date_headers: l
     """
 
     builder = _base_builder(data, row_id_column="domain_id")
-    _configure_domain_band_columns(builder)
+    # Historical columns stretch to fill the grid width (flex), with Trend 1.5×
+    # the count columns.
+    _configure_domain_band_columns(builder, count_flex=1)
+    # Collection Region / Proxy (from any feed's device aimpoint) between Red and
+    # Trend — like the Current tab, but flexed to fill the wider Historical grid.
+    builder.configure_column("coll_region", header_name="Collection Region", flex=1, minWidth=200)
+    builder.configure_column("proxy", header_name="Proxy", flex=1, minWidth=120)
     builder.configure_column("feed_rows_json", hide=True)
     # Last column: a pre-rendered PNG line sparkline of the domain's daily
     # delivered totals, shown as the cell's background image (the raw data-URI
@@ -410,6 +495,7 @@ def build_history_master_detail_grid_options(data: pd.DataFrame, date_headers: l
     builder.configure_column(
         "trend_img",
         header_name="Trend",
+        flex=1.5,          # 1.5× the other (flex=1) columns
         minWidth=170,
         sortable=False,
         filter=False,
